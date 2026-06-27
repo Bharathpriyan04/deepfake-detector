@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-import torch, cv2, numpy as np, sys, os, tempfile
+import torch, cv2, numpy as np, sys, os, tempfile, urllib.request
 
 sys.path.insert(0, ".")
 from src.model import DualStreamDetector
@@ -14,18 +14,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load model once at startup ──────────────────────────────────────────────
+# ── Auto-download model from Hugging Face if not present ────────────────────
+MODEL_PATH = "FINAL_MODEL_exp6.pt"
+HF_URL = os.environ.get(
+    "MODEL_URL",
+    "https://huggingface.co/Bharathpriyan04/deepfake-detector-model/resolve/main/FINAL_MODEL_exp6.pt"
+)
+
+if not os.path.exists(MODEL_PATH):
+    print(f"Downloading model from Hugging Face...")
+    urllib.request.urlretrieve(HF_URL, MODEL_PATH)
+    print(f"Model downloaded — {os.path.getsize(MODEL_PATH) / 1e6:.1f} MB")
+
+# ── Load model ───────────────────────────────────────────────────────────────
 device = torch.device("cpu")
 model = DualStreamDetector(pretrained=False).to(device)
-
-MODEL_PATH = os.environ.get("MODEL_PATH", "FINAL_MODEL_exp6.pt")
-if os.path.exists(MODEL_PATH):
-    ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"✅ Model loaded — AUC: {ckpt.get('best_auc', 'N/A')}")
-else:
-    print(f"⚠️  Model file not found at {MODEL_PATH}")
+ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+model.load_state_dict(ckpt["model"])
+model.eval()
+print(f"Model loaded — AUC: {ckpt.get('best_auc', 'N/A')}")
 
 
 def predict_frame(frame_rgb: np.ndarray) -> float:
@@ -36,17 +43,13 @@ def predict_frame(frame_rgb: np.ndarray) -> float:
     return prob
 
 
-# ── Routes ──────────────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {"status": "Deepfake Detector API is running", "version": "1.0.0"}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.post("/predict/image")
 async def predict_image(file: UploadFile = File(...)):
@@ -55,17 +58,14 @@ async def predict_image(file: UploadFile = File(...)):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return {"error": "Cannot read image. Make sure it is a valid JPG or PNG."}
-
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     prob = predict_frame(img_rgb)
-
     return {
         "verdict": "FAKE" if prob > 0.5 else "REAL",
         "fake_probability": round(prob * 100, 2),
         "real_probability": round((1 - prob) * 100, 2),
         "confidence": round(max(prob, 1 - prob) * 100, 2),
     }
-
 
 @app.post("/predict/video")
 async def predict_video(file: UploadFile = File(...)):
@@ -87,7 +87,6 @@ async def predict_video(file: UploadFile = File(...)):
     )
 
     probs, frame_results = [], []
-
     for idx in frame_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
@@ -96,13 +95,11 @@ async def predict_video(file: UploadFile = File(...)):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         prob = predict_frame(frame_rgb)
         probs.append(prob)
-        frame_results.append(
-            {
-                "frame": int(idx),
-                "fake_probability": round(prob * 100, 2),
-                "verdict": "FAKE" if prob > 0.5 else "REAL",
-            }
-        )
+        frame_results.append({
+            "frame": int(idx),
+            "fake_probability": round(prob * 100, 2),
+            "verdict": "FAKE" if prob > 0.5 else "REAL",
+        })
 
     cap.release()
     os.unlink(tmp_path)
