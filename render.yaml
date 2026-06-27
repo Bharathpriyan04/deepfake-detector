@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: deepfake-detector-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MODEL_PATH
+        value: FINAL_MODEL_exp6.pt
+    disk:
+      name: model-storage
+      mountPath: /opt/render/project/src
+      sizeGB: 1
