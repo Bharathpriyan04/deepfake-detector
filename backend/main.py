@@ -1,11 +1,46 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import torch, cv2, numpy as np, sys, os, tempfile, urllib.request
 
 sys.path.insert(0, ".")
 from src.model import DualStreamDetector
 
-app = FastAPI(title="Deepfake Detector API", version="1.0.0")
+# ── Model setup ──────────────────────────────────────────────────────────────
+MODEL_PATH = "FINAL_MODEL_exp6.pt"
+HF_URL = os.environ.get(
+    "MODEL_URL",
+    "https://huggingface.co/Bharathpriyan04/deepfake-detector-model/resolve/main/FINAL_MODEL_exp6.pt"
+)
+
+model = None
+
+def load_model():
+    global model
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading model from Hugging Face...")
+        urllib.request.urlretrieve(HF_URL, MODEL_PATH)
+        print(f"Downloaded — {os.path.getsize(MODEL_PATH)/1e6:.1f} MB")
+
+    device = torch.device("cpu")
+    m = DualStreamDetector(pretrained=False).to(device)
+    ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+    m.load_state_dict(ckpt["model"])
+    m.eval()
+
+    # Free memory immediately after loading
+    del ckpt
+    import gc; gc.collect()
+
+    model = m
+    print("Model ready — AUC 0.8562")
+
+@asynccontextmanager
+async def lifespan(app):
+    load_model()
+    yield
+
+app = FastAPI(title="Deepfake Detector API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,34 +49,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Auto-download model from Hugging Face if not present ────────────────────
-MODEL_PATH = "FINAL_MODEL_exp6.pt"
-HF_URL = os.environ.get(
-    "MODEL_URL",
-    "https://huggingface.co/Bharathpriyan04/deepfake-detector-model/resolve/main/FINAL_MODEL_exp6.pt"
-)
-
-if not os.path.exists(MODEL_PATH):
-    print(f"Downloading model from Hugging Face...")
-    urllib.request.urlretrieve(HF_URL, MODEL_PATH)
-    print(f"Model downloaded — {os.path.getsize(MODEL_PATH) / 1e6:.1f} MB")
-
-# ── Load model ───────────────────────────────────────────────────────────────
-device = torch.device("cpu")
-model = DualStreamDetector(pretrained=False).to(device)
-ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-model.load_state_dict(ckpt["model"])
-model.eval()
-print(f"Model loaded — AUC: {ckpt.get('best_auc', 'N/A')}")
-
-
 def predict_frame(frame_rgb: np.ndarray) -> float:
     img = cv2.resize(frame_rgb, (224, 224)).astype(np.float32) / 255.0
-    tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
+    tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
     with torch.no_grad():
         prob = torch.sigmoid(model(tensor)).item()
-    return prob
-
+    return float(prob)
 
 @app.get("/")
 def root():
@@ -49,15 +62,17 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model_loaded": model is not None}
 
 @app.post("/predict/image")
 async def predict_image(file: UploadFile = File(...)):
+    if model is None:
+        return {"error": "Model not loaded yet, please retry in 30 seconds."}
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
-        return {"error": "Cannot read image. Make sure it is a valid JPG or PNG."}
+        return {"error": "Cannot read image. Use JPG or PNG."}
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     prob = predict_frame(img_rgb)
     return {
@@ -69,6 +84,8 @@ async def predict_image(file: UploadFile = File(...)):
 
 @app.post("/predict/video")
 async def predict_video(file: UploadFile = File(...)):
+    if model is None:
+        return {"error": "Model not loaded yet, please retry in 30 seconds."}
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
